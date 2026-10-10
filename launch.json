@@ -6,10 +6,10 @@
       "constructorArgs": [
         "0x8366a39CC670B4001A1121B8F6A443A643e40951",
         "10000",
-        "$owner",
+        "0x35da9c0303507ddf708e87f2568eddf12c47a059",
         "0x35da9c0303507ddf708e87f2568eddf12c47a059"
       ]
     }
   ],
-  "notes": "Deploy IMD6900PerpsLaunch on Robinhood Chain with a 1% static pool fee. $owner resolves to 0x35da9c0303507ddf708e87f2568eddf12c47a059. The constructor creates IMD6900PerpPool, mines a CREATE2 salt from its own address for IMD6900PerpHook with exactly FLAGS, creates and wires the hook, and assigns both contracts to the owner. Read pool(), hook() and salt() from the launch. The owner opens the pool after the Pons launch, then separately deploys the perps engine and wires it through setPerpEngine on the hook and pool."
+  "notes": "Deploy IMD6900PerpsLaunch on Robinhood Chain with a 1% static pool fee. The owner and hook fee address are both 0x35da9c0303507ddf708e87f2568eddf12c47a059. The constructor creates IMD6900PerpPool, mines a CREATE2 salt from its own address for IMD6900PerpHook with exactly FLAGS, creates and wires the hook, and assigns both contracts to the owner. Read pool(), hook() and salt() from the launch. The owner opens the pool after the Pons launch, then separately deploys the perps engine and wires it through setPerpEngine on the hook and pool."
 }
