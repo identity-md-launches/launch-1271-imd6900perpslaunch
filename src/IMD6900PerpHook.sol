@@ -10,7 +10,11 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary,
+    toBeforeSwapDelta
+} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
@@ -88,7 +92,7 @@ interface IFeeSink {
 ///         pocket by the pool's own accounting. The cost is that one rate applies to everyone — the engine and our
 ///         own arbitrage vault included — so there are no per-caller exemptions and no surcharge for trading against
 ///         a mispriced pool. `feeBps` and `perpFeeBps` remain only as what the engine reads to model its solvency,
-///         and must be kept equal to the pool's real fee.
+///         and must be kept equal to the pool's real fee: both are derived from `poolFeePips` at construction.
 ///
 contract IMD6900PerpHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
@@ -107,10 +111,10 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     /// @notice IMD6900PerpPool: initializes the pool, owns its liquidity
     address public immutable launcher;
 
-    /// @notice Fee on every other trade, in basis points of its ETH leg
-    uint256 public feeBps = 1_000;
-    /// @notice Fee on the perps engine's own swaps
-    uint256 public perpFeeBps = 100;
+    /// @notice Fee on every other trade, in basis points of its ETH leg: the pool's own static fee, from construction
+    uint256 public feeBps;
+    /// @notice Fee on the perps engine's own swaps: the same pool fee (capped at {MAX_PERP_FEE_BPS}), from construction
+    uint256 public perpFeeBps;
     /// @notice Receives 3% of the fees; renounceable into the launcher for good
     address public feeAddress;
     bool public feeAddressRenounced;
@@ -176,7 +180,12 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         BaseHook(poolManager_)
     {
         if (LPFeeLibrary.isDynamicFee(poolFeePips_) || poolFeePips_ > LPFeeLibrary.MAX_LP_FEE) revert InvalidFee();
+        if (feeAddress_ == address(0)) revert ZeroAddress(); // flush() would burn its 3% (updateFeeAddress refuses the same)
         poolFeePips = poolFeePips_;
+        // what the engine models is the pool's real fee: pips are hundredths of a bip, so 100 pips to the bp
+        uint256 fee = uint256(poolFeePips_) / 100;
+        feeBps = fee;
+        perpFeeBps = fee > MAX_PERP_FEE_BPS ? MAX_PERP_FEE_BPS : fee;
         launcher = launcher_;
         feeAddress = feeAddress_;
         _initializeOwner(owner_);
@@ -366,12 +375,12 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         return BaseHook.beforeInitialize.selector;
     }
 
-    function _beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata params, bytes calldata)
-        internal
-        view
-        override
-        returns (bytes4)
-    {
+    function _beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) internal view override returns (bytes4) {
         _checkLiquidity(sender, params);
         return BaseHook.beforeAddLiquidity.selector;
     }
@@ -461,8 +470,9 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         uint256 reserve = spec != 0 ? SWEEP_GAS_RESERVE + SWEEP_GAS_MIN : SWEEP_GAS_RESERVE;
         uint256 g = gasleft();
         if (g > reserve + SWEEP_GAS_MIN) {
-            (bool ok, bytes memory out) =
-                engine.call{gas: g - reserve}(abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit)));
+            (bool ok, bytes memory out) = engine.call{gas: g - reserve}(
+                abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit))
+            );
             if (spec == 0) return;
             if (!ok || out.length < 32) {
                 if (!sweepFailOpen) revert SweepUnavailable();

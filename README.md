@@ -13,8 +13,9 @@ protocol owns in full, that its perps engine trades against, held near the coin'
   uses no return deltas and no dynamic fee, so Uniswap's router quotes the pool on its own. Only its pool may
   initialize it or add and remove liquidity, full range only.
 - `src/IMD6900PerpPool.sol`: the pool's one position. The owner opens it once the coin trades on Pons (the price, the
-  ETH, the coin), anyone can deepen it, only the owner can take liquidity out and never while that would leave an open
-  perps position liquidatable. The pool's static fee accrues to this position: the protocol earns it.
+  ETH, the coin), anyone can deepen it (within 1% of the Pons price), only the owner can take liquidity out and never
+  while that would leave an open perps position liquidatable. The pool's static fee accrues to this position: the
+  protocol earns it.
 - `src/IMD6900PerpsLaunch.sol`: what the swarm deploys. Uniswap v4 reads a hook's permissions from the low 14 bits of
   its address, so the hook must sit at a mined address, and IMD deploys from its own deployer, which nobody can mine
   for in advance. So this constructor does it: it creates the pool, tries CREATE2 salts from itself until the hook's
@@ -84,6 +85,21 @@ The swarm's five auditors found four medium and several low issues; every one is
   (it would strand the liquidity), ETH goes out with plain transfers (no forced-send forwarder), an addition reports its
   principal (the fees the position earned stay in the pool), and a price outside the full range is `ZeroLiquidity`.
 - The dead skim setting is gone: `setBand(maxDeviationBps)`.
+
+The swarm's second pass (job d07ab5c6 and the import audit of this relaunch) found two medium and two low issues;
+every one is fixed and held by `test/AuditFixes.t.sol` too (`ADAPTATION.md` has each finding, its reproduction and
+its fix):
+
+- `compound()` and `addLiquidity()` both run only within 1% of the Pons price (`COMPOUND_MAX_DEV_BPS`) and never
+  without one: a reference the hook cannot read is `NoPonsReference`, not "on price". Either could be sandwiched
+  before: a push inside the 30% band, the pairing at that price, a sell-back into the depth it added.
+- The hook's constructor refuses a zero fee address (as `updateFeeAddress` already did): `flush()` would have burnt
+  its 3%.
+- `feeBps` and `perpFeeBps`, what the engine model reads as the pool's fee, are derived from `poolFeePips` at
+  construction (100 bps for this launch's 1%) instead of starting at 10%.
+- The ten `Ownable` entry points the hook and the pool inherit from solady (transfer, renounce, request / cancel /
+  complete handover) and the owner's right to take all the liquidity back whatever the hook's state are tested
+  explicitly.
 
 ## Admission (what IMD checks, and the tests that check it first)
 

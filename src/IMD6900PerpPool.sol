@@ -24,8 +24,9 @@ interface IFeeSink {
     function addFees() external payable;
 }
 
-/// @notice IMD6900PerpHook: how far this pool sits from the Pons price
+/// @notice IMD6900PerpHook: the Pons price it follows (0 when it cannot read one) and how far this pool sits from it
 interface IBandView {
+    function ponsPriceX96() external view returns (uint256);
     function deviationBps() external view returns (uint256);
 }
 
@@ -76,10 +77,13 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     error ZeroAddress();
     error NotAContract();
     error OffPons(uint256 deviationBps);
+    /// @notice The hook cannot read the Pons price right now, so the pool's distance from it cannot be judged
+    error NoPonsReference();
     error NoRenounce();
 
-    /// @notice compound() runs only this close to the Pons price: it pairs the pool's own idle ETH and coin at the
-    ///         spot price, so a caller who had just pushed the price would buy that pairing cheap
+    /// @notice {compound} and {addLiquidity} run only this close to the Pons price, and never without one: both pair
+    ///         ETH and coin at the spot price into a position this contract owns, so a caller who had just pushed the
+    ///         price inside the band would buy that pairing cheap and sell back into the depth it added
     uint256 public constant COMPOUND_MAX_DEV_BPS = 100;
 
     constructor(IPoolManager poolManager_, uint24 poolFee_, address owner_) {
@@ -173,8 +177,10 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
 
     /// @notice Deepens the pool with the ETH sent and up to `tokenAmount` of the caller's coin (approve first); what
     ///         the price doesn't take goes back to `refundTo`. The liquidity is this contract's, not the caller's.
+    ///         Only within {COMPOUND_MAX_DEV_BPS} of the Pons price (OffPons, NoPonsReference otherwise).
     function addLiquidity(uint256 tokenAmount, address refundTo) external payable nonReentrant {
         if (token == address(0)) revert NotOpen();
+        _requireOnPons();
         SafeTransferLib.safeTransferFrom(token, msg.sender, address(this), tokenAmount);
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey().toId());
         uint128 liq = _fullRangeLiquidity(sqrtPriceX96, msg.value, tokenAmount);
@@ -192,8 +198,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     ///      pool's own. This is what turns the fee share and the skim into depth.
     function compound(uint256 minEth, uint256 minTokens) external nonReentrant returns (uint128 liq) {
         if (token == address(0)) revert NotOpen();
-        uint256 dev = IBandView(hook).deviationBps();
-        if (dev > COMPOUND_MAX_DEV_BPS) revert OffPons(dev);
+        _requireOnPons();
         uint256 ethHave = address(this).balance;
         uint256 tokensHave = SafeTransferLib.balanceOf(token, address(this));
         if (ethHave < minEth || tokensHave < minTokens) revert ZeroLiquidity();
@@ -253,6 +258,15 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     receive() external payable {}
 
     /*                              INTERNAL                                */
+
+    /// @dev The pool must sit within {COMPOUND_MAX_DEV_BPS} of a Pons price the hook can actually read. A reference of
+    ///      0 means the hook has none (the band is off then too), which is "cannot judge", never "on price".
+    function _requireOnPons() internal view {
+        IBandView h = IBandView(hook);
+        if (h.ponsPriceX96() == 0) revert NoPonsReference();
+        uint256 dev = h.deviationBps();
+        if (dev > COMPOUND_MAX_DEV_BPS) revert OffPons(dev);
+    }
 
     function _modify(int256 liquidityDelta) internal returns (uint256 eth, uint256 tokens) {
         (eth, tokens) = abi.decode(poolManager.unlock(abi.encode(liquidityDelta)), (uint256, uint256));
