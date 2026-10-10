@@ -81,7 +81,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     error NoPonsReference();
     error NoRenounce();
 
-    /// @notice {compound} and {addLiquidity} run only this close to the Pons price, and never without one: both pair
+    /// @notice {open}, {compound} and {addLiquidity} run only this close to the Pons price, and never without one: they pair
     ///         ETH and coin at the spot price into a position this contract owns, so a caller who had just pushed the
     ///         price inside the band would buy that pairing cheap and sell back into the depth it added
     uint256 public constant COMPOUND_MAX_DEV_BPS = 100;
@@ -165,6 +165,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         curve = curve_;
         SafeTransferLib.safeTransferFrom(token_, msg.sender, address(this), tokenAmount);
         poolManager.initialize(poolKey(), sqrtPriceX96);
+        _requireOnPons();
         uint128 liq = _fullRangeLiquidity(sqrtPriceX96, msg.value, tokenAmount);
         if (liq == 0) revert ZeroLiquidity();
         (uint256 ethIn, uint256 tokensIn) = _modify(int256(uint256(liq)));
@@ -191,16 +192,20 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         emit LiquidityAdded(msg.sender, liq, ethIn, tokensIn);
     }
 
-    /// @notice Pairs what this contract already holds — the ETH its fee share sends here and the coin the hook
-    ///         skimmed from arbitrageurs — into more liquidity. Anyone can call it, and everything it adds belongs
-    ///         to this contract like the rest.
-    /// @dev Without this the two would sit here for good: {addLiquidity} pairs the CALLER's ETH and coin, not the
-    ///      pool's own. This is what turns the fee share and the skim into depth.
+    /// @notice Pairs the pool's idle ETH and coin into more liquidity. If either balance is empty, first collects
+    ///         the existing position's earned fees. Coin can also be sent here by the owner; the hook skims none.
+    ///         Anyone can call it, and everything it adds belongs to this contract like the rest.
+    /// @dev Both currencies are needed. With no earned fees or matching idle currency, reverts ZeroLiquidity.
     function compound(uint256 minEth, uint256 minTokens) external nonReentrant returns (uint128 liq) {
         if (token == address(0)) revert NotOpen();
         _requireOnPons();
         uint256 ethHave = address(this).balance;
         uint256 tokensHave = SafeTransferLib.balanceOf(token, address(this));
+        if ((ethHave == 0 || tokensHave == 0) && liquidity() != 0) {
+            _modify(0); // v4 collects fees without changing the non-empty position's liquidity
+            ethHave = address(this).balance;
+            tokensHave = SafeTransferLib.balanceOf(token, address(this));
+        }
         if (ethHave < minEth || tokensHave < minTokens) revert ZeroLiquidity();
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey().toId());
         liq = _fullRangeLiquidity(sqrtPriceX96, ethHave, tokensHave);

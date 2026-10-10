@@ -31,9 +31,14 @@ contract IMD6900PerpsLaunchTest is Test {
     }
 
     function test_FitsOneTransaction() public {
+        bytes memory init =
+            abi.encodePacked(type(IMD6900PerpsLaunch).creationCode, abi.encode(PM, uint24(10_000), OWNER, FEE));
+        address deployed;
         uint256 g = gasleft();
-        new IMD6900PerpsLaunch(PM, 10_000, OWNER, FEE);
+        assembly ("memory-safe") { deployed := create(0, add(init, 32), mload(init)) }
         uint256 used = g - gasleft();
+        assertTrue(deployed != address(0), "the raw CREATE succeeded");
+        assertGt(used, 3_000_000, "constructor gas is metered");
         emit log_named_uint("launch gas (the mining included)", used);
         assertLt(used, 1 << 24, "under EIP-7825's per-transaction cap");
     }

@@ -19,8 +19,9 @@ contract IMD6900PerpsLaunch {
     ///      the pool Uniswap's automatic routing (no return deltas, no dynamic fee)
     uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
         | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG;
-    /// @dev One salt in 16,384 fits on average; a million tries leave a miss at about e^-64
-    uint256 internal constant MAX_TRIES = 1 << 20;
+    /// @dev Bound the search so mining plus deployment fits the transaction budget. A rare miss reverts NoSalt;
+    ///      admission must simulate the exact factory address and salt, then use a new launch number on a miss.
+    uint256 internal constant MAX_TRIES = 134_144;
 
     IMD6900PerpPool public immutable pool;
     IMD6900PerpHook public immutable hook;
@@ -53,23 +54,44 @@ contract IMD6900PerpsLaunch {
 
     /// @dev The first salt whose CREATE2 address from here carries exactly {FLAGS} in its low 14 bits
     function _mine(bytes32 initHash) internal view returns (bytes32 s) {
-        address me = address(this);
         uint256 flags = FLAGS;
-        uint256 tries = MAX_TRIES;
         bool found;
         assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            mstore(ptr, me) // the address in bytes 12..31
-            mstore8(add(ptr, 11), 0xff) // 0xff ++ address ++ salt ++ initHash: 85 bytes from ptr + 11
-            mstore(add(ptr, 0x40), initHash)
-            for { let i := 0 } lt(i, tries) { i := add(i, 1) } {
-                mstore(add(ptr, 0x20), i)
-                if eq(and(keccak256(add(ptr, 11), 85), 0x3fff), flags) {
-                    s := i
+            // Temporarily use 0x00..0x5f for the CREATE2 preimage. Restore the free-memory pointer before leaving;
+            // the zero slot at 0x60 is untouched. This avoids pointer arithmetic on every hash.
+            let free := mload(0x40)
+            mstore(0, address())
+            mstore8(11, 0xff)
+            mstore(0x40, initHash)
+            // Check eight consecutive salts per batch, with one branch per batch rather than per hash.
+            for { let i := 0 } lt(i, MAX_TRIES) { i := add(i, 8) } {
+                mstore(0x20, i)
+                let hit := eq(and(keccak256(11, 85), 0x3fff), flags)
+                mstore(0x20, add(i, 1))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 2))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 3))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 4))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 5))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 6))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                mstore(0x20, add(i, 7))
+                hit := or(hit, eq(and(keccak256(11, 85), 0x3fff), flags))
+                if hit {
+                    // Only the winning batch is searched again, to preserve the first matching salt.
+                    for { s := i } 1 { s := add(s, 1) } {
+                        mstore(0x20, s)
+                        if eq(and(keccak256(11, 85), 0x3fff), flags) { break }
+                    }
                     found := 1
                     break
                 }
             }
+            mstore(0x40, free)
         }
         if (!found) revert NoSalt();
     }

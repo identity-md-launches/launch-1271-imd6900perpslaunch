@@ -269,6 +269,17 @@ contract RobinhoodFlowForkTest is Test {
         pool.setFeeSink(address(L));
         vm.stopPrank();
 
+        // Exercise the actual sink's addFees() ABI, not just the creator-fee harvest path (bbd87e2e).
+        vm.deal(address(hook), 1 ether);
+        uint256 poolBeforeFlush = address(pool).balance;
+        uint256 ownerBeforeFlush = DEPLOYER.balance;
+        uint256 potBeforeFlush = POT_BRIDGE.balance;
+        hook.flush();
+        assertEq(address(hook).balance, 0, "the configured launcher accepts addFees");
+        assertApproxEqAbs(address(pool).balance - poolBeforeFlush, 0.097 ether, 2);
+        assertApproxEqAbs(DEPLOYER.balance - ownerBeforeFlush, 0.224 ether, 2);
+        assertApproxEqAbs(POT_BRIDGE.balance - potBeforeFlush, 0.679 ether, 2);
+
         vm.deal(address(this), 2 ether);
         IPonsCurve(L.curve()).buy{value: 1 ether}(1 ether, 0, address(this)); // Pons trading books creator fees
         uint256 p0 = address(pool).balance;
@@ -280,7 +291,9 @@ contract RobinhoodFlowForkTest is Test {
         // the pool's ETH share pairs with coin it holds into more depth, once the pool is back at the Pons price (the
         // buy above moved Pons; compound refuses to pair off it): buys on the pool pull it there
         PoolKey memory key = _key(pool);
-        for (uint256 i; i < 40 && hook.deviationBps() > 80; ++i) trader.swap{value: 0.01 ether}(key, true, -int256(0.01 ether));
+        for (uint256 i; i < 40 && hook.deviationBps() > 80; ++i) {
+            trader.swap{value: 0.01 ether}(key, true, -int256(0.01 ether));
+        }
         assertLe(hook.deviationBps(), 100, "the pool is back at the Pons price");
         vm.prank(DEPLOYER);
         L.release(1_000_000 ether, address(pool));

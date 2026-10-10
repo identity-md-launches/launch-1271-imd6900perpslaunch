@@ -9,12 +9,12 @@ protocol owns in full, that its perps engine trades against, held near the coin'
 - `src/IMD6900PerpHook.sol`: the hook. Before any swap that isn't the perps engine's own, it asks the engine to close
   every position that trade would sink, at the price before it moves; a sweep that can't finish reverts the trade (no
   bad debt outranks always-tradeable, with an owner escape hatch for a broken engine). After the swap it refuses to
-  leave the pool further than `maxDeviationBps` (30%) from the coin's Pons price, unless the trade moved it closer. It
+  leave the pool further than `maxDeviationBps` (30%) from Pons in **coin per ETH**, unless the trade moved it closer. It
   uses no return deltas and no dynamic fee, so Uniswap's router quotes the pool on its own. Only its pool may
   initialize it or add and remove liquidity, full range only.
 - `src/IMD6900PerpPool.sol`: the pool's one position. The owner opens it once the coin trades on Pons (the price, the
-  ETH, the coin), anyone can deepen it (within 1% of the Pons price), only the owner can take liquidity out and never
-  while that would leave an open perps position liquidatable. The pool's static fee accrues to this position: the
+  ETH, the coin), within 1% of a readable Pons price. Anyone can deepen it under the same guard; only the owner can
+  take liquidity out, and never while that would leave an open perps position liquidatable. The pool's static fee accrues to this position: the
   protocol earns it.
 - `src/IMD6900PerpsLaunch.sol`: what the swarm deploys. Uniswap v4 reads a hook's permissions from the low 14 bits of
   its address, so the hook must sit at a mined address, and IMD deploys from its own deployer, which nobody can mine
@@ -52,14 +52,20 @@ refund opens this pool. `script/Owner.s.sol` runs the steps from the team wallet
    20% the team; the pool's fee sink is the launcher.
 3. Deploy the perps engine and its vault against the open pool, then `hook.setPerpEngine(engine)` and
    `pool.setPerpEngine(engine)`.
-4. Hand both to the Robinhood timelock (`transferOwnership`).
+4. Hand both to the Robinhood timelock using the two-step handover on **each** contract: the timelock calls
+   `requestOwnershipHandover()`, then the current owner calls `completeOwnershipHandover(timelock)` within 48 hours.
+   Verify both `owner()` values. The one-step `transferOwnership` remains available; `NoRenounce` does not protect
+   against transferring to an incorrect or unusable nonzero address.
 
 **The liquidity always comes back.** The pool contract owns all of it and its owner can take it all out with
 `removeLiquidity`; the hook only checks that the caller is the pool and the range is full, so no hook state can stop
 it. The one guard is the pool's own engine check (no withdrawal that leaves an open position liquidatable), which the
 owner can switch off with `pool.setPerpEngine(address(0))`. The hook is not upgradeable on purpose: a proxy needs
 DELEGATECALL, which IMD's admission refuses, and an upgradeable hook would let one key change everyone's trading rules.
-A new hook is a new launch: take the liquidity out, open the new pool with it.
+A new hook is a new launch: settle and close every engine position first, unwire the old engine on both contracts,
+then take the liquidity out and open the new pool with it. A zero-liquidity pool's price can move within the band
+without exchanging assets, so an engine must not keep using it as a mark. Disabling the withdrawal check alone is
+not a safe migration for live positions.
 
 `test/RobinhoodFlow.fork.t.sol` (needs `ROBINHOOD_RPC_URL`) runs all of it on live Robinhood state: the launcher's
 2 ETH dev buy (525.7M coins, 0.8283 ETH refunded, 205.6M releasable), this launch as the swarm deploys it, the pool
@@ -107,14 +113,56 @@ its fix):
 
 - `test_DeploysOnAFreshChain`: the launch deploys where nothing it names exists (IMD deploys a launch on a fresh chain
   first); the hook's address carries its flags, the pool and the hook name each other, both are the owner's.
-- `test_FitsOneTransaction`: the whole launch, the mining included, under EIP-7825's 2^24 gas. The mining depends on
-  the deployer's address: over 40 addresses it took ~17k tries on average at ~128 gas each (5.9M gas mean, 10.5M the
-  worst); the cap leaves room for ~95k tries, which one deployer in ~350 would need.
+- `test_FitsOneTransaction` uses raw CREATE and requires a metered cost above 3M. `test/LaunchAdmission.t.sol` also
+  uses raw CREATE2, includes calldata/intrinsic gas and factory headroom, and tests 24 factory salts plus the reported
+  salt 50149. A fixed address/hash retains the original 132,475-attempt regression even when launch bytecode changes.
+  The miner now tests eight salts per batch (~90 gas/attempt) and stops after 134,144 attempts with `NoSalt`.
+  Exhaustion costs about 12.03M gas for mining; the gas-budget test accounts for deploying and wiring the contracts.
 - `test_EachDeployerMinesItsOwnSalt`: whatever address deploys it, it finds its own salt.
 - `test_PassesTheAdmissionScan`: no contract's code shows CALLCODE, DELEGATECALL or SELFDESTRUCT (PUSH data skipped).
 - `test_RefusesADynamicFee`: a dynamic fee would cost the pool Uniswap's automatic routing; the hook refuses it.
 - `test/IMD6900Perps.t.sol`, against a real v4 PoolManager (vendored, tests only): the pool opens at the Pons price,
   trades both ways, refuses a trade that would leave it more than 30% from Pons, refuses anyone else's liquidity, only
   the owner opens it and takes liquidity out, anyone deepens it, and perps stay off until an engine is set.
+
+### Rehearse the actual factory deployment
+
+Salt search is probabilistic across addresses, deterministic for a particular launch. No finite transaction can
+promise a matching hash for every possible deployer. The bounded search misses roughly one address in 3,600 under
+uniform hashing. An average or a sample is not admission for the actual launch.
+
+Before admission, supply the real `IMD_PROJECT_FACTORY` and `IMD_PROJECT_SALT_0` (the factory's resolved CREATE2 salt)
+and run `forge test --offline --match-test test_ActualFactorySaltWhenProvided -vv`. This local rehearsal uses the
+exact constructor arguments above and the current compiled init code at that factory address. It skips when the
+factory is not supplied; it does not invent a production factory or launch number. The deployment service must also
+simulate its complete transaction with its own wrapper overhead and total gas limit at or below 16,777,216.
+
+On `NoSalt` or an over-budget simulation, do not broadcast or retry the identical bytes with a higher gas limit.
+Request a new launch number from the launch service, derive its new factory salt/address, and repeat admission and
+simulation. The four constructor arguments and hook permission flags stay unchanged. This worker neither signs nor
+broadcasts transactions.
+
+### Fee accounting and owner trust
+
+- The pool charges its immutable 1% on every swap. `feeFor`, `feeBps` and `perpFeeBps` report that same rate (100 bps).
+  `feeExempt` exempts only from the Pons band. The legacy `lowerFee` entry point always refuses a change;
+  `setPerpFeeBps` accepts only the actual pool rate. Neither changes swap accounting or the 97%/3% stray-ETH split.
+- `compound` pairs idle balances. If either currency is missing, it first collects earned fees from a non-empty
+  position. If no matching coin exists even then, the owner must supply coin before compounding. `removeLiquidity`
+  returns position principal and earned fees, not unrelated idle balances. To recover unmatched idle ETH, send the
+  matching coin, compound while on Pons, then remove the resulting liquidity. The hook does not skim coin.
+- The band uses `abs(poolCoinPerEth - ponsCoinPerEth) / ponsCoinPerEth`, rounded down to basis points. The default
+  30% band therefore spans roughly -23.08% to +42.86% in the reciprocal ETH-per-coin price. It is not a symmetric
+  ETH-per-coin limit; the future engine must use the documented units and assess the mark's liquidity.
+- `open` now enforces the same readable-reference/1% guard as additions and compounding. If the Pons price changed
+  since script simulation, opening reverts atomically; recompute the quote and retry.
+- The owner can redirect the fee address before a flush (including ETH already received), renounce that share to
+  the pool, change band exemptions and width, repoint the curve, replace or disable either engine, and enable
+  fail-open sweeping. A hook engine without compatible code blocks ordinary swaps until repaired or fail-open is
+  enabled. Hook and pool ownership and engine settings are independent and must be checked separately.
+- A fee sink must implement payable `addFees()`. Code presence alone does not establish compatibility. A reverting
+  sink leaves the hook's balance intact; the owner can use `setFeeSink(address(0))` to retain subsequent flushes in
+  the pool, or configure a working sink. The fork flow now calls `flush` through the actual configured Pons launcher
+  and checks its split. That integration remains unverified until the fork suite is run with `ROBINHOOD_RPC_URL`.
 
 Every library is vendored under `lib/` (only the files imported), so it builds offline: see `lib/README.md`.

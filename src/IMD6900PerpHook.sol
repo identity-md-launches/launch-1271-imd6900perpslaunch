@@ -99,9 +99,9 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     using StateLibrary for IPoolManager;
 
     uint256 internal constant BPS = 10_000;
-    /// @notice The trading fee can be lowered to this, never below, and never raised
+    /// @notice Legacy model limit, retained for ABI compatibility; the pool's static fee cannot be lowered
     uint256 public constant MIN_FEE_BPS = 100;
-    /// @notice The perps engine's rate never exceeds this (PerpEngine assumes the same cap)
+    /// @notice Legacy engine model limit; an engine must support this pool's actual fee before being wired
     uint256 public constant MAX_PERP_FEE_BPS = 1_000;
     int24 public constant TICK_SPACING = 60;
     /// @dev Gas kept back for the rest of the swap when a sweep runs, and the least worth forwarding (MiFrens)
@@ -113,7 +113,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
 
     /// @notice Fee on every other trade, in basis points of its ETH leg: the pool's own static fee, from construction
     uint256 public feeBps;
-    /// @notice Fee on the perps engine's own swaps: the same pool fee (capped at {MAX_PERP_FEE_BPS}), from construction
+    /// @notice Fee on the perps engine's own swaps: the same pool fee, from construction
     uint256 public perpFeeBps;
     /// @notice Receives 3% of the fees; renounceable into the launcher for good
     address public feeAddress;
@@ -124,7 +124,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     bool public sweepFailOpen;
     /// @notice The one pool this hook serves
     PoolId public poolId;
-    /// @notice Protocol-owned callers whose swaps the band does not judge (the engine model reads them as fee-free)
+    /// @notice Protocol-owned callers whose swaps the band does not judge; they still pay the pool's static fee
     mapping(address => bool) public feeExempt;
 
     /*                     FOLLOWING THE PONS PRICE                        */
@@ -185,7 +185,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         // what the engine models is the pool's real fee: pips are hundredths of a bip, so 100 pips to the bp
         uint256 fee = uint256(poolFeePips_) / 100;
         feeBps = fee;
-        perpFeeBps = fee > MAX_PERP_FEE_BPS ? MAX_PERP_FEE_BPS : fee;
+        perpFeeBps = fee;
         launcher = launcher_;
         feeAddress = feeAddress_;
         _initializeOwner(owner_);
@@ -212,14 +212,13 @@ contract IMD6900PerpHook is BaseHook, Ownable {
 
     /*                    OWNER (the Robinhood timelock)                    */
 
-    function lowerFee(uint256 newFeeBps) external onlyOwner {
-        if (newFeeBps >= feeBps || newFeeBps < MIN_FEE_BPS) revert InvalidFee();
-        feeBps = newFeeBps;
-        emit FeeLowered(newFeeBps);
+    /// @notice Retained for ABI compatibility. A static pool fee cannot be lowered by changing its model.
+    function lowerFee(uint256) external onlyOwner {
+        revert InvalidFee();
     }
 
     function setPerpFeeBps(uint256 bps) external onlyOwner {
-        if (bps > MAX_PERP_FEE_BPS) revert InvalidFee();
+        if (bps != uint256(poolFeePips) / 100) revert InvalidFee();
         perpFeeBps = bps;
         emit PerpFeeSet(bps);
     }
@@ -336,7 +335,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         return FullMath.mulDiv(sq, sq, Q96);
     }
 
-    /// @notice How far this pool sits from the Pons price, in basis points
+    /// @notice Distance in coin per ETH: abs(pool - Pons) / Pons, in basis points (not ETH per coin)
     function deviationBps() public view returns (uint256) {
         return _deviation(poolPriceX96(), ponsPriceX96());
     }
@@ -354,11 +353,9 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         return sender != perpEngine && !feeExempt[sender];
     }
 
-    /// @notice The fee a swap by `sender` pays, in basis points of its ETH leg
-    function feeFor(address sender) public view returns (uint256) {
-        if (feeExempt[sender]) return 0;
-        if (sender == perpEngine && sender != address(0)) return perpFeeBps;
-        return feeBps;
+    /// @notice The static fee every sender pays, in whole basis points (100 pips per bp)
+    function feeFor(address) public view returns (uint256) {
+        return uint256(poolFeePips) / 100;
     }
 
     /*                              CALLBACKS                               */
